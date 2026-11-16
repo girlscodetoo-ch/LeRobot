@@ -30,6 +30,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from pathlib import Path
 from tkinter import font as tkfont
@@ -43,6 +44,9 @@ DEFAULT_CONFIG = {
     "follower_id": "my_follower_arm",
     "leader_port": "/dev/ttyACM0",
     "leader_id": "my_leader_arm",
+    "dataset_repo_id": "workshop/my_session",
+    "task_description": "Testing",
+    "episode_time_s": "10",
 }
 
 COLOR_BG = "#FAC5D7"
@@ -87,6 +91,64 @@ def build_command(cfg):
     ]
 
 
+def dataset_root(repo_id):
+    """Local folder of a recorded dataset: LeRobot's default location, $HF_LEROBOT_HOME/<repo_id>.
+
+    Passed explicitly to lerobot-record and lerobot-replay: `--resume=true` refuses to run without
+    `--dataset.root`, and it also makes replay read the local copy instead of looking on the Hub.
+    """
+    from huggingface_hub.constants import HF_HOME  # same base folder as lerobot.utils.constants
+
+    home = Path(os.getenv("HF_LEROBOT_HOME", Path(HF_HOME) / "lerobot")).expanduser()
+    return home / repo_id
+
+
+def build_record_command(cfg, repo_id, resume):
+    """Command to record exactly one episode into `repo_id` (locally, no Hub upload)."""
+    model = cfg.get("robot_model", "SO-101")
+    prefix = "so101" if model == "SO-101" else "so100"
+    try:
+        episode_time_s = float(cfg.get("episode_time_s", 10))
+    except (TypeError, ValueError):
+        episode_time_s = 10.0
+    task = cfg.get("task_description") or "Manipulation demo"
+    return [
+        "lerobot-record",
+        f"--robot.type={prefix}_follower",
+        f"--robot.port={cfg['follower_port']}",
+        f"--robot.id={cfg['follower_id']}",
+        f"--teleop.type={prefix}_leader",
+        f"--teleop.port={cfg['leader_port']}",
+        f"--teleop.id={cfg['leader_id']}",
+        f"--dataset.repo_id={repo_id}",
+        f"--dataset.root={dataset_root(repo_id)}",
+        f"--dataset.single_task={task}",
+        f"--dataset.episode_time_s={episode_time_s}",
+        "--dataset.num_episodes=1",
+        "--dataset.push_to_hub=false",
+        "--dataset.video=false",
+        # The GUI already adds a timestamp to repo_id and reuses that exact name for later
+        # episodes (resume) and for replay: lerobot-record must not add a second one.
+        "--dataset.no_stamp=true",
+        f"--resume={'true' if resume else 'false'}",
+    ]
+
+
+def build_replay_command(cfg, repo_id, episode):
+    """Command to replay a single recorded episode on the follower arm."""
+    model = cfg.get("robot_model", "SO-101")
+    prefix = "so101" if model == "SO-101" else "so100"
+    return [
+        "lerobot-replay",
+        f"--robot.type={prefix}_follower",
+        f"--robot.port={cfg['follower_port']}",
+        f"--robot.id={cfg['follower_id']}",
+        f"--dataset.repo_id={repo_id}",
+        f"--dataset.root={dataset_root(repo_id)}",
+        f"--dataset.episode={episode}",
+    ]
+
+
 class SettingsWindow(tk.Toplevel):
     def __init__(self, master, cfg, on_save):
         super().__init__(master)
@@ -128,6 +190,9 @@ class SettingsWindow(tk.Toplevel):
             ("follower_id", "ID - follower arm", "my_follower_arm"),
             ("leader_port", "USB port - leader arm", "/dev/ttyACM0 (or COM3)"),
             ("leader_id", "ID - leader arm", "my_leader_arm"),
+            ("dataset_repo_id", "Dataset name", "workshop/my_session"),
+            ("task_description", "Task description", "Pick up the cube"),
+            ("episode_time_s", "Episode duration (seconds)", "10"),
         ]
         for key, label, placeholder in fields:
             row += 1
@@ -176,6 +241,9 @@ class TeleopApp(tk.Tk):
         self.cfg = load_config()
         self.process = None
         self.running = False
+        self.mode = None  # "teleop" | "record" | "replay" while self.running is True
+        self.dataset_repo_id = None  # stamped once, then reused (resume=true) for later episodes
+        self.episode_count = 0
         self.log_queue = queue.Queue()
         self.log_visible = False
 
@@ -230,6 +298,42 @@ class TeleopApp(tk.Tk):
             content, textvariable=self.hint_var, bg=COLOR_CARD, fg="#B00020",
             font=tkfont.Font(size=10), wraplength=420, justify="center",
         ).pack(pady=(0, 16))
+
+        # Record / replay controls. Only one of teleoperation / recording / replay can
+        # run at a time (they all take exclusive control of the robot's USB ports).
+        rec_frame = tk.Frame(self, bg=COLOR_BG)
+        rec_frame.pack(pady=(0, 10))
+
+        self.record_button = tk.Button(
+            rec_frame, text="🔴 Record an episode", command=self.toggle_record,
+            bg=COLOR_ACCENT, fg="white", font=tkfont.Font(size=11, weight="bold"),
+            relief="flat", padx=14, pady=6, cursor="hand2",
+        )
+        self.record_button.grid(row=0, column=0, columnspan=3, pady=(0, 8))
+
+        self.episodes_var = tk.StringVar(value="Episodes recorded: 0")
+        tk.Label(
+            rec_frame, textvariable=self.episodes_var, bg=COLOR_BG, fg=COLOR_TEXT,
+            font=tkfont.Font(size=10),
+        ).grid(row=1, column=0, columnspan=3)
+
+        tk.Label(
+            rec_frame, text="Replay episode #", bg=COLOR_BG, fg=COLOR_TEXT,
+            font=tkfont.Font(size=10),
+        ).grid(row=2, column=0, sticky="e", pady=(8, 0))
+
+        self.replay_episode_var = tk.IntVar(value=0)
+        self.replay_spinbox = tk.Spinbox(
+            rec_frame, from_=0, to=0, width=4, textvariable=self.replay_episode_var,
+        )
+        self.replay_spinbox.grid(row=2, column=1, sticky="w", padx=6, pady=(8, 0))
+
+        self.replay_button = tk.Button(
+            rec_frame, text="▶ Replay", command=self.toggle_replay,
+            bg=COLOR_ACCENT, fg="white", font=tkfont.Font(size=10, weight="bold"),
+            relief="flat", padx=10, pady=3, cursor="hand2", state="disabled",
+        )
+        self.replay_button.grid(row=2, column=2, pady=(8, 0))
 
         # Collapsible technical log panel (for troubleshooting)
         self.toggle_log_var = tk.StringVar(value="Show technical details ▾")
@@ -299,14 +403,33 @@ class TeleopApp(tk.Tk):
 
     def toggle(self):
         if self.running:
-            self.stop_teleop()
+            if self.mode == "teleop":
+                self.stop_current()
+            else:
+                messagebox.showinfo("Robot busy", "Stop the current recording/replay first.")
         else:
             self.start_teleop()
 
-    def start_teleop(self):
-        self.hint_var.set("")
-        cmd = build_command(self.cfg)
-        self._append_log(f"\n$ {' '.join(cmd)}\n")
+    def toggle_record(self):
+        if self.running:
+            if self.mode == "record":
+                self.stop_current()
+            else:
+                messagebox.showinfo("Robot busy", "Stop the current action first.")
+        else:
+            self.start_record()
+
+    def toggle_replay(self):
+        if self.running:
+            if self.mode == "replay":
+                self.stop_current()
+            else:
+                messagebox.showinfo("Robot busy", "Stop the current action first.")
+        else:
+            self.start_replay()
+
+    def _launch_process(self, cmd, mode):
+        """Start `cmd` as the exclusive robot-controlling process. Returns True on success."""
         try:
             self.process = subprocess.Popen(
                 cmd,
@@ -319,33 +442,78 @@ class TeleopApp(tk.Tk):
         except FileNotFoundError:
             messagebox.showerror(
                 "Command not found",
-                "The 'lerobot-teleoperate' command was not found.\n\n"
+                f"The '{cmd[0]}' command was not found.\n\n"
                 "Check that LeRobot is properly installed and that this\n"
                 "application is launched from the same environment\n"
                 "(e.g. the same conda/virtualenv environment)."
             )
-            self._append_log("Error: 'lerobot-teleoperate' command not found.\n")
-            return
+            self._append_log(f"Error: '{cmd[0]}' command not found.\n")
+            return False
 
         self.running = True
-        self.status_var.set("🟡 Connecting to the robot...")
-        self.big_button.config(text="STOP", bg=COLOR_STOP,
-                                 activebackground=COLOR_STOP_HOVER)
+        self.mode = mode
 
         self._monitor_thread = threading.Thread(
             target=self._watch_process, daemon=True
         )
         self._monitor_thread.start()
 
-        # Some versions of lerobot-teleoperate pause on startup waiting for
-        # Enter (e.g. a calibration-mismatch confirmation). Since children
-        # can't see that prompt in this app, send a couple of newlines
-        # automatically so it's never silently stuck waiting for a key press.
+        # Some of these commands pause on startup waiting for Enter (e.g. a
+        # calibration-mismatch confirmation). Since children can't see that
+        # prompt in this app, send a couple of newlines automatically so it's
+        # never silently stuck waiting for a key press.
         self.after(800, self._send_enter)
         self.after(2500, self._send_enter)
+        return True
+
+    def start_teleop(self):
+        self.hint_var.set("")
+        cmd = build_command(self.cfg)
+        self._append_log(f"\n$ {' '.join(cmd)}\n")
+        if not self._launch_process(cmd, mode="teleop"):
+            return
+
+        self.status_var.set("🟡 Connecting to the robot...")
+        self.big_button.config(text="STOP", bg=COLOR_STOP,
+                                 activebackground=COLOR_STOP_HOVER)
 
         # After a short delay, assume connection succeeded if process is alive
         self.after(2500, self._confirm_running)
+
+    def start_record(self):
+        self.hint_var.set("")
+        if self.dataset_repo_id is None:
+            base = (self.cfg.get("dataset_repo_id") or "workshop/my_session").strip()
+            self.dataset_repo_id = f"{base}_{time.strftime('%Y%m%d_%H%M%S')}"
+            resume = False
+        else:
+            resume = True
+
+        cmd = build_record_command(self.cfg, self.dataset_repo_id, resume)
+        self._append_log(f"\n$ {' '.join(cmd)}\n")
+        if not self._launch_process(cmd, mode="record"):
+            return
+
+        self.status_var.set(f"🔴 Recording episode {self.episode_count}...")
+        self.record_button.config(text="⏹ Stop recording", bg=COLOR_STOP)
+        self.hint_var.set(
+            "Recording... move the leader arm. Stopping early may leave this\n"
+            "episode unusable - it's safer to let it finish on its own."
+        )
+
+    def start_replay(self):
+        if self.dataset_repo_id is None:
+            messagebox.showinfo("No recording yet", "Record at least one episode before replaying.")
+            return
+
+        episode = self.replay_episode_var.get()
+        cmd = build_replay_command(self.cfg, self.dataset_repo_id, episode)
+        self._append_log(f"\n$ {' '.join(cmd)}\n")
+        if not self._launch_process(cmd, mode="replay"):
+            return
+
+        self.status_var.set(f"▶️ Replaying episode {episode}...")
+        self.replay_button.config(text="⏹ Stop replay", bg=COLOR_STOP)
 
     def _send_enter(self):
         if self.process is not None and self.process.poll() is None:
@@ -356,7 +524,7 @@ class TeleopApp(tk.Tk):
                 pass
 
     def _confirm_running(self):
-        if self.running and self.process and self.process.poll() is None:
+        if self.running and self.mode == "teleop" and self.process and self.process.poll() is None:
             self.status_var.set("🟢 Robot running - move the leader arm!")
 
     def _watch_process(self):
@@ -372,15 +540,34 @@ class TeleopApp(tk.Tk):
 
     def _process_ended(self, return_code, output_lines):
         was_running = self.running
+        mode = self.mode
         self.running = False
+        self.mode = None
         self.process = None
+
         self.big_button.config(text="START", bg=COLOR_START,
                                  activebackground=COLOR_START_HOVER)
-        self.status_var.set("🔴 Robot stopped")
+        self.record_button.config(text="🔴 Record an episode", bg=COLOR_ACCENT)
+        self.replay_button.config(text="▶ Replay", bg=COLOR_ACCENT)
+
+        clean_exit = return_code in (0, None, -15, -9)  # -15/-9: stopped on purpose
+
+        if mode == "record" and was_running and return_code == 0:
+            self.episode_count += 1
+            self.episodes_var.set(f"Episodes recorded: {self.episode_count}")
+            self.replay_spinbox.config(to=self.episode_count - 1)
+            self.replay_episode_var.set(self.episode_count - 1)
+            self.replay_button.config(state="normal")
+            self.status_var.set(f"✅ Episode {self.episode_count - 1} recorded")
+            self.hint_var.set("")
+        elif mode == "replay" and was_running and return_code == 0:
+            self.status_var.set("✅ Replay finished")
+        else:
+            self.status_var.set("🔴 Robot stopped")
+
         self._append_log(f"(process ended, exit code: {return_code})\n")
 
-        if was_running and return_code not in (0, None) and return_code != -15 \
-                and return_code != -9:
+        if was_running and not clean_exit:
             tail = "".join(output_lines[-15:])
             self.hint_var.set(
                 "The robot stopped because of a problem.\n"
@@ -389,11 +576,10 @@ class TeleopApp(tk.Tk):
             )
             print(tail, file=sys.stderr)
 
-    def stop_teleop(self):
-        self.status_var.set("🔴 Robot stopped")
-        self.big_button.config(text="START", bg=COLOR_START,
-                                 activebackground=COLOR_START_HOVER)
+    def stop_current(self):
+        """Emergency stop for whichever process (teleop/record/replay) is running."""
         self.running = False
+        self.status_var.set("⏳ Stopping...")
         if self.process is not None:
             try:
                 self.process.terminate()
@@ -401,7 +587,7 @@ class TeleopApp(tk.Tk):
                 pass
 
     def _on_close(self):
-        self.stop_teleop()
+        self.stop_current()
         self.destroy()
 
 

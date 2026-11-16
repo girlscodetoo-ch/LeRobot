@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Plot 3D - Trajectoire du gripper pendant une teleoperation (SO-101)
 =====================================================================
@@ -9,8 +8,11 @@ a chaque instant (calculee par cinematique directe a partir des angles des
 moteurs) et affiche, une fois la teleoperation arretee (Ctrl+C), un graphique
 3D du chemin parcouru.
 
+Version compatible Windows : la cinematique directe est calculee directement
+a partir du fichier URDF, en Python pur (numpy + bibliotheque standard).
+Plus besoin de 'placo', qui ne s'installe pas sous Windows.
+
 Prerequis (une seule fois) :
-    pip install -e ".[kinematics]"     # installe placo, utilise pour la cinematique
     pip install -e ".[matplotlib-dep]" # installe matplotlib, utilise pour le graphique
 
 Le modele 3D du bras (fichier URDF) est telecharge automatiquement depuis
@@ -21,6 +23,7 @@ Lancement :
 """
 
 import time
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -56,22 +59,114 @@ def ensure_so101_urdf() -> str:
     return str(urdf_path)
 
 
-def main():
-    try:
-        from lerobot.model.kinematics import RobotKinematics
-    except ImportError as e:
-        raise ImportError(
-            "La cinematique directe necessite 'placo'. Installe-le avec :\n"
-            '    pip install -e ".[kinematics]"'
-        ) from e
 
+def _parse_floats(text: str | None, default: tuple[float, float, float]) -> np.ndarray:
+    if text is None:
+        return np.array(default, dtype=float)
+    return np.array([float(v) for v in text.split()], dtype=float)
+
+
+def _rpy_to_matrix(rpy: np.ndarray) -> np.ndarray:
+    """Convention URDF : R = Rz(yaw) @ Ry(pitch) @ Rx(roll)."""
+    r, p, y = rpy
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return rz @ ry @ rx
+
+
+def _axis_angle_to_matrix(axis: np.ndarray, angle: float) -> np.ndarray:
+    """Rotation d'un angle (radians) autour d'un axe (formule de Rodrigues)."""
+    axis = axis / np.linalg.norm(axis)
+    k = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(angle) * k + (1 - np.cos(angle)) * (k @ k)
+
+
+class UrdfForwardKinematics:
+    """Cinematique directe minimale lue depuis un fichier URDF.
+
+    Meme utilisation que RobotKinematics de LeRobot :
+    forward_kinematics(angles_en_degres) -> matrice 4x4 de la pose du repere cible.
+    """
+
+    def __init__(self, urdf_path: str, target_frame_name: str, joint_names: list[str]):
+        root = ET.parse(urdf_path).getroot()
+
+        # Pour chaque maillon, on retient l'articulation qui le relie a son parent.
+        joints_by_child = {}
+        for joint in root.findall("joint"):
+            origin = joint.find("origin")
+            xyz = _parse_floats(origin.get("xyz") if origin is not None else None, (0, 0, 0))
+            rpy = _parse_floats(origin.get("rpy") if origin is not None else None, (0, 0, 0))
+            t_origin = np.eye(4)
+            t_origin[:3, :3] = _rpy_to_matrix(rpy)
+            t_origin[:3, 3] = xyz
+
+            axis_el = joint.find("axis")
+            axis = _parse_floats(axis_el.get("xyz") if axis_el is not None else None, (1, 0, 0))
+
+            joints_by_child[joint.find("child").get("link")] = {
+                "name": joint.get("name"),
+                "type": joint.get("type"),
+                "parent": joint.find("parent").get("link"),
+                "origin": t_origin,
+                "axis": axis,
+            }
+
+        link_names = {link.get("name") for link in root.findall("link")}
+        if target_frame_name not in link_names:
+            raise ValueError(
+                f"Le repere '{target_frame_name}' n'existe pas dans l'URDF. "
+                f"Reperes disponibles : {sorted(link_names)}"
+            )
+
+        # On remonte du repere cible jusqu'a la base, puis on inverse l'ordre.
+        chain = []
+        link = target_frame_name
+        while link in joints_by_child:
+            joint = joints_by_child[link]
+            chain.append(joint)
+            link = joint["parent"]
+        self.chain = list(reversed(chain))
+
+        self.joint_index = {name: i for i, name in enumerate(joint_names)}
+        missing = [
+            j["name"]
+            for j in self.chain
+            if j["type"] in ("revolute", "continuous", "prismatic") and j["name"] not in self.joint_index
+        ]
+        if missing:
+            print(f"Attention : articulations de l'URDF absentes des moteurs (fixees a 0) : {missing}")
+
+    def forward_kinematics(self, joint_pos_deg: np.ndarray) -> np.ndarray:
+        q = np.deg2rad(np.asarray(joint_pos_deg, dtype=float))
+        pose = np.eye(4)
+        for joint in self.chain:
+            pose = pose @ joint["origin"]
+            value = q[self.joint_index[joint["name"]]] if joint["name"] in self.joint_index else 0.0
+            motion = np.eye(4)
+            if joint["type"] in ("revolute", "continuous"):
+                motion[:3, :3] = _axis_angle_to_matrix(joint["axis"], value)
+            elif joint["type"] == "prismatic":
+                motion[:3, 3] = joint["axis"] * value
+            pose = pose @ motion
+        return pose
+
+
+# ---------------------------------------------------------------------------
+
+
+def main():
     follower = SO101Follower(SO101FollowerConfig(port=FOLLOWER_PORT, id=FOLLOWER_ID))
     leader = SO101Leader(SO101LeaderConfig(port=LEADER_PORT, id=LEADER_ID))
     follower.connect()
     leader.connect()
 
     motor_names = list(follower.bus.motors.keys())
-    kinematics = RobotKinematics(
+    kinematics = UrdfForwardKinematics(
         urdf_path=ensure_so101_urdf(),
         target_frame_name=TARGET_FRAME_NAME,
         joint_names=motor_names,
@@ -139,9 +234,11 @@ def plot_trajectory_3d(positions: np.ndarray, timestamps: np.ndarray) -> None:
     ax.text(x[-1], y[-1], z[-1], "Fin", color="#52514e", fontsize=9)
     ax.scatter([x[0], x[-1]], [y[0], y[-1]], [z[0], z[-1]], color="#0d366b", s=25)
 
-    ax.set_xlim(x.min(), x.max())
-    ax.set_ylim(y.min(), y.max())
-    ax.set_zlim(z.min(), z.max())
+    # Petite marge pour eviter une erreur si le bras n'a pas bouge sur un axe.
+    margin = 0.01
+    ax.set_xlim(x.min() - margin, x.max() + margin)
+    ax.set_ylim(y.min() - margin, y.max() + margin)
+    ax.set_zlim(z.min() - margin, z.max() + margin)
     ax.set_xlabel("x (m)")
     ax.set_ylabel("y (m)")
     ax.set_zlabel("z (m)")

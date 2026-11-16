@@ -50,7 +50,7 @@ def main():
     fig.patch.set_facecolor("#fcfcfb")
     ax.set_facecolor("#fcfcfb")
     lines = {
-        name: ax.plot([], [], label=name, color=MOTOR_COLORS[name], linewidth=2)[0]
+        name: ax.plot([], [], label=name, color=MOTOR_COLORS.get(name, MOTOR_COLORS.get(f"{name}.pos")), linewidth=2)[0]
         for name in motor_names
     }
     ax.set_xlabel("temps (s)")
