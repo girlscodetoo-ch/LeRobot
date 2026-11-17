@@ -49,6 +49,15 @@ from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 # same physical arms on another computer. Every lerobot command started by the GUI inherits this.
 os.environ.setdefault("HF_LEROBOT_CALIBRATION", str(Path(__file__).with_name("calibration")))
 
+# Arms calibrated with a plain `lerobot-calibrate` in a terminal are saved in LeRobot's cache, not in
+# the repo: copy them over (without overwriting anything) so the GUI finds them too.
+try:
+    from calibrer_robot import import_cache_calibrations
+
+    import_cache_calibrations()
+except Exception as exc:  # never block the GUI for this
+    print(f"Could not import the cached calibrations: {exc}", file=sys.stderr)
+
 from teleop_gui_i18n import LANGUAGES, get_language, set_language, tr
 from test_lerobot_teleop_gui import (
     CONFIG_PATH,
