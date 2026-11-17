@@ -45,6 +45,10 @@ from tkinter import messagebox
 
 from PIL import Image, ImageDraw, ImageFilter, ImageOps, ImageTk
 
+# The arms' calibration files live in the repo (calibration/), so a `git pull` is enough to use the
+# same physical arms on another computer. Every lerobot command started by the GUI inherits this.
+os.environ.setdefault("HF_LEROBOT_CALIBRATION", str(Path(__file__).with_name("calibration")))
+
 from teleop_gui_i18n import LANGUAGES, get_language, set_language, tr
 from test_lerobot_teleop_gui import (
     CONFIG_PATH,

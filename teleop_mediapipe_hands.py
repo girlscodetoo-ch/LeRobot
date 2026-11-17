@@ -37,6 +37,7 @@ writing "quit" on its standard input, so the arm still goes back to its starting
 import argparse
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -52,6 +53,9 @@ from mediapipe.tasks.python import BaseOptions, vision
 from PIL import Image, ImageTk
 
 from test_lerobot_teleop_gui import load_config
+
+# Same calibration files as the GUI: the ones in the repo (calibration/)
+os.environ.setdefault("HF_LEROBOT_CALIBRATION", str(Path(__file__).with_name("calibration")))
 
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/"

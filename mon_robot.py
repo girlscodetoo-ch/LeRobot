@@ -1,4 +1,7 @@
+import os
 import time
+
+os.environ["HF_LEROBOT_CALIBRATION"] = os.path.join(os.path.dirname(__file__), "calibration")  # calibrations du repo
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
 # On se connecte au robot
